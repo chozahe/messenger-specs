@@ -1,0 +1,954 @@
+openapi: 3.1.0
+
+info:
+  title: Chat Service API
+  version: 1.0.0
+  description: |
+    Управление чатами и участниками. Сервис является source of truth для всех данных о чатах.
+
+    **Аутентификация:** все эндпоинты требуют валидный JWT. Токен передаётся в заголовке
+    `Authorization: Bearer <token>`. Валидация токена происходит на уровне API Gateway —
+    сервис получает уже проверенный `X-User-Id` в заголовке запроса.
+
+    **Версионирование:** текущая версия API — `v1`. Префикс `/api/v1` обязателен.
+
+    **Идемпотентность:** операции создания поддерживают заголовок `Idempotency-Key`.
+    Повторный запрос с тем же ключом вернёт оригинальный результат без побочных эффектов.
+
+servers:
+  - url: https://api.example.com/api/v1
+    description: Production
+  - url: http://localhost:8080/api/v1
+    description: Local development
+
+tags:
+  - name: Chats
+    description: Создание, получение и удаление чатов
+  - name: Members
+    description: Управление участниками чата
+
+# ─────────────────────────────────────────────
+# SECURITY
+# ─────────────────────────────────────────────
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT выдаётся Auth Service. Валидируется на API Gateway.
+        Сервис получает `X-User-Id` и `X-User-Roles` в заголовках — не валидирует токен самостоятельно.
+
+  # ─────────────────────────────────────────────
+  # HEADERS
+  # ─────────────────────────────────────────────
+  headers:
+    X-Request-Id:
+      description: Уникальный идентификатор запроса для трейсинга
+      schema:
+        type: string
+        format: uuid
+    X-RateLimit-Limit:
+      description: Максимальное количество запросов в окне
+      schema:
+        type: integer
+    X-RateLimit-Remaining:
+      description: Оставшееся количество запросов в текущем окне
+      schema:
+        type: integer
+    X-RateLimit-Reset:
+      description: Unix timestamp сброса счётчика
+      schema:
+        type: integer
+
+  # ─────────────────────────────────────────────
+  # PARAMETERS
+  # ─────────────────────────────────────────────
+  parameters:
+    ChatId:
+      name: chat_id
+      in: path
+      required: true
+      description: UUID чата
+      schema:
+        type: string
+        format: uuid
+      example: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      description: UUID пользователя
+      schema:
+        type: string
+        format: uuid
+      example: "7b9c1d2e-3f4a-5b6c-7d8e-9f0a1b2c3d4e"
+
+    PageLimit:
+      name: limit
+      in: query
+      required: false
+      description: Количество элементов на странице (default 20, max 100)
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+
+    PageCursor:
+      name: cursor
+      in: query
+      required: false
+      description: Курсор пагинации (opaque string из предыдущего ответа)
+      schema:
+        type: string
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Уникальный ключ для идемпотентных операций создания.
+        При повторном запросе с тем же ключом в течение 24 часов
+        вернётся оригинальный ответ без повторного выполнения операции.
+      schema:
+        type: string
+        maxLength: 64
+
+  # ─────────────────────────────────────────────
+  # SCHEMAS
+  # ─────────────────────────────────────────────
+  schemas:
+
+    ChatType:
+      type: string
+      enum:
+        - direct
+        - group
+      description: |
+        `direct` — личный диалог между двумя пользователями (ровно 2 участника, нельзя добавить третьего).
+        `group` — групповой чат (от 2 до 1000 участников).
+
+    MemberRole:
+      type: string
+      enum:
+        - owner
+        - admin
+        - member
+      description: |
+        `owner` — создатель чата. Один на чат. Может всё.
+        `admin` — может добавлять/удалять участников и менять их роли (кроме owner).
+        `member` — обычный участник. Может писать сообщения.
+
+    ChatMember:
+      type: object
+      required:
+        - user_id
+        - role
+        - joined_at
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          description: UUID пользователя
+        role:
+          $ref: "#/components/schemas/MemberRole"
+        joined_at:
+          type: string
+          format: date-time
+          description: Время вступления в чат (UTC, ISO8601)
+        invited_by:
+          type: string
+          format: uuid
+          nullable: true
+          description: UUID пользователя, который добавил этого участника. Null для создателя.
+
+    Chat:
+      type: object
+      required:
+        - id
+        - type
+        - created_by
+        - created_at
+        - updated_at
+        - members_count
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Уникальный идентификатор чата
+        type:
+          $ref: "#/components/schemas/ChatType"
+        title:
+          type: string
+          nullable: true
+          maxLength: 128
+          description: Название чата. Только для group. Для direct всегда null.
+          example: "Команда бэкенда"
+        avatar_url:
+          type: string
+          format: uri
+          nullable: true
+          description: URL аватара чата. Только для group.
+        created_by:
+          type: string
+          format: uuid
+          description: UUID пользователя-создателя
+        created_at:
+          type: string
+          format: date-time
+          description: Время создания (UTC, ISO8601)
+        updated_at:
+          type: string
+          format: date-time
+          description: Время последнего изменения метаданных чата (UTC, ISO8601)
+        members_count:
+          type: integer
+          minimum: 2
+          description: Текущее количество участников
+        last_message_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Время последнего сообщения в чате. Обновляется асинхронно через событие.
+
+    ChatList:
+      type: object
+      required:
+        - items
+        - pagination
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Chat"
+        pagination:
+          $ref: "#/components/schemas/CursorPagination"
+
+    MemberList:
+      type: object
+      required:
+        - items
+        - pagination
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMember"
+        pagination:
+          $ref: "#/components/schemas/CursorPagination"
+
+    CursorPagination:
+      type: object
+      required:
+        - has_next
+      properties:
+        next_cursor:
+          type: string
+          nullable: true
+          description: Курсор для следующей страницы. Null если страниц больше нет.
+        has_next:
+          type: boolean
+          description: Есть ли следующая страница
+
+    # ── Requests ──────────────────────────────
+
+    CreateChatRequest:
+      type: object
+      required:
+        - type
+        - member_ids
+      properties:
+        type:
+          $ref: "#/components/schemas/ChatType"
+        title:
+          type: string
+          nullable: true
+          minLength: 1
+          maxLength: 128
+          description: |
+            Обязательно для group. Должно быть null или отсутствовать для direct.
+          example: "Команда бэкенда"
+        avatar_url:
+          type: string
+          format: uri
+          nullable: true
+          description: URL аватара. Только для group. Загрузка файла — через Attachment Service.
+        member_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+          maxItems: 999
+          description: |
+            Список UUID пользователей, которых добавить в чат при создании.
+            Создатель (из X-User-Id) добавляется автоматически с ролью owner и не должен присутствовать в этом списке.
+            Для direct — ровно 1 UUID (второй участник).
+            Для group — от 1 до 999 UUID.
+          example:
+            - "7b9c1d2e-3f4a-5b6c-7d8e-9f0a1b2c3d4e"
+
+    UpdateChatRequest:
+      type: object
+      description: Все поля опциональны. Передавать только те, которые нужно обновить.
+      properties:
+        title:
+          type: string
+          nullable: true
+          minLength: 1
+          maxLength: 128
+          description: Новое название. Только для group.
+        avatar_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Новый URL аватара. Только для group. null — удалить аватар.
+
+    AddMembersRequest:
+      type: object
+      required:
+        - user_ids
+      properties:
+        user_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+          minItems: 1
+          maxItems: 100
+          description: |
+            UUID пользователей для добавления.
+            Пользователи, которые уже являются участниками, игнорируются (не ошибка).
+          example:
+            - "7b9c1d2e-3f4a-5b6c-7d8e-9f0a1b2c3d4e"
+
+    UpdateMemberRoleRequest:
+      type: object
+      required:
+        - role
+      properties:
+        role:
+          type: string
+          enum:
+            - admin
+            - member
+          description: Новая роль участника. Нельзя назначить owner через этот эндпоинт.
+
+    # ── Errors ────────────────────────────────
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: object
+          required:
+            - code
+            - message
+          properties:
+            code:
+              type: string
+              description: Машиночитаемый код ошибки
+              example: "chat_not_found"
+            message:
+              type: string
+              description: Человекочитаемое описание ошибки
+              example: "Chat with specified id does not exist"
+            details:
+              type: object
+              nullable: true
+              description: Дополнительные данные об ошибке (поля валидации и т.д.)
+              additionalProperties: true
+
+  # ─────────────────────────────────────────────
+  # RESPONSES
+  # ─────────────────────────────────────────────
+  responses:
+    Unauthorized:
+      description: Невалидный или отсутствующий JWT
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: "unauthorized"
+              message: "Missing or invalid authorization token"
+
+    Forbidden:
+      description: Недостаточно прав для выполнения операции
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: "forbidden"
+              message: "You don't have permission to perform this action"
+
+    NotFound:
+      description: Ресурс не найден
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: "chat_not_found"
+              message: "Chat with specified id does not exist"
+
+    UnprocessableEntity:
+      description: Ошибка валидации входных данных
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: "validation_error"
+              message: "Request validation failed"
+              details:
+                fields:
+                  title: "required for group chats"
+                  member_ids: "must contain at least 1 element"
+
+    Conflict:
+      description: Конфликт состояния (например, чат уже существует)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: "direct_chat_already_exists"
+              message: "Direct chat between these users already exists"
+              details:
+                existing_chat_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+
+    TooManyRequests:
+      description: Превышен rate limit
+      headers:
+        X-RateLimit-Limit:
+          $ref: "#/components/headers/X-RateLimit-Limit"
+        X-RateLimit-Remaining:
+          $ref: "#/components/headers/X-RateLimit-Remaining"
+        X-RateLimit-Reset:
+          $ref: "#/components/headers/X-RateLimit-Reset"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: "rate_limit_exceeded"
+              message: "Too many requests, please slow down"
+
+    InternalServerError:
+      description: Внутренняя ошибка сервера
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: "internal_error"
+              message: "An unexpected error occurred"
+
+# ─────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────
+paths:
+
+  # ══════════════════════════════════════════
+  # CHATS
+  # ══════════════════════════════════════════
+
+  /chats:
+    get:
+      operationId: listChats
+      tags: [Chats]
+      summary: Список чатов текущего пользователя
+      description: |
+        Возвращает все чаты, в которых состоит аутентифицированный пользователь (из `X-User-Id`).
+        Результат отсортирован по `last_message_at` desc (сначала активные чаты).
+        Поддерживает курсорную пагинацию.
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
+        - name: type
+          in: query
+          required: false
+          description: Фильтр по типу чата
+          schema:
+            $ref: "#/components/schemas/ChatType"
+      responses:
+        "200":
+          description: Список чатов
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatList"
+              example:
+                items:
+                  - id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+                    type: "group"
+                    title: "Команда бэкенда"
+                    avatar_url: "https://storage.example.com/avatars/abc.jpg"
+                    created_by: "7b9c1d2e-3f4a-5b6c-7d8e-9f0a1b2c3d4e"
+                    created_at: "2024-01-15T10:00:00Z"
+                    updated_at: "2024-01-15T10:00:00Z"
+                    members_count: 5
+                    last_message_at: "2024-06-01T14:32:00Z"
+                pagination:
+                  next_cursor: "eyJpZCI6IjNmYTg1ZjY0In0="
+                  has_next: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+    post:
+      operationId: createChat
+      tags: [Chats]
+      summary: Создать чат
+      description: |
+        Создаёт новый чат.
+
+        **Direct чат:**
+        - `title` должен отсутствовать или быть null
+        - `member_ids` — ровно 1 UUID (второй участник)
+        - Если direct чат между этими двумя пользователями уже существует — вернёт 409 с `existing_chat_id`
+
+        **Group чат:**
+        - `title` обязателен
+        - `member_ids` — от 1 до 999 UUID
+        - Создатель автоматически получает роль `owner`
+
+        Операция атомарна: чат и все участники создаются в одной транзакции.
+        После успешного создания публикуется событие `chat.created` в Kafka.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateChatRequest"
+            examples:
+              direct:
+                summary: Создать личный диалог
+                value:
+                  type: "direct"
+                  member_ids:
+                    - "7b9c1d2e-3f4a-5b6c-7d8e-9f0a1b2c3d4e"
+              group:
+                summary: Создать групповой чат
+                value:
+                  type: "group"
+                  title: "Команда бэкенда"
+                  avatar_url: "https://storage.example.com/avatars/abc.jpg"
+                  member_ids:
+                    - "7b9c1d2e-3f4a-5b6c-7d8e-9f0a1b2c3d4e"
+                    - "8c0d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+      responses:
+        "201":
+          description: Чат успешно создан
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Chat"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /chats/{chat_id}:
+    get:
+      operationId: getChat
+      tags: [Chats]
+      summary: Получить чат по ID
+      description: |
+        Возвращает данные чата. Доступно только участникам чата.
+      parameters:
+        - $ref: "#/components/parameters/ChatId"
+      responses:
+        "200":
+          description: Данные чата
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Chat"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+    patch:
+      operationId: updateChat
+      tags: [Chats]
+      summary: Обновить метаданные чата
+      description: |
+        Обновляет `title` и/или `avatar_url` группового чата.
+        Доступно только для owner и admin.
+        Для direct чатов всегда возвращает 403.
+        После успешного обновления публикуется событие `chat.updated` в Kafka.
+      parameters:
+        - $ref: "#/components/parameters/ChatId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateChatRequest"
+            example:
+              title: "Новое название команды"
+              avatar_url: null
+      responses:
+        "200":
+          description: Обновлённые данные чата
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Chat"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+    delete:
+      operationId: deleteChat
+      tags: [Chats]
+      summary: Удалить чат
+      description: |
+        Удаляет чат и всех его участников. Soft delete — данные физически не удаляются сразу.
+        Доступно только для owner.
+        После удаления публикуется событие `chat.deleted` в Kafka.
+        Возвращает 204 при успехе. Повторный вызов также вернёт 204 (идемпотентен).
+      parameters:
+        - $ref: "#/components/parameters/ChatId"
+      responses:
+        "204":
+          description: Чат удалён
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  # ══════════════════════════════════════════
+  # MEMBERS
+  # ══════════════════════════════════════════
+
+  /chats/{chat_id}/members:
+    get:
+      operationId: listMembers
+      tags: [Members]
+      summary: Список участников чата
+      description: |
+        Возвращает всех участников чата с их ролями.
+        Доступно только участникам чата.
+        Результат отсортирован: сначала owner, затем admin, затем member. Внутри каждой роли — по `joined_at` asc.
+      parameters:
+        - $ref: "#/components/parameters/ChatId"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
+      responses:
+        "200":
+          description: Список участников
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemberList"
+              example:
+                items:
+                  - user_id: "7b9c1d2e-3f4a-5b6c-7d8e-9f0a1b2c3d4e"
+                    role: "owner"
+                    joined_at: "2024-01-15T10:00:00Z"
+                    invited_by: null
+                  - user_id: "8c0d2e3f-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+                    role: "member"
+                    joined_at: "2024-01-15T10:05:00Z"
+                    invited_by: "7b9c1d2e-3f4a-5b6c-7d8e-9f0a1b2c3d4e"
+                pagination:
+                  next_cursor: null
+                  has_next: false
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+    post:
+      operationId: addMembers
+      tags: [Members]
+      summary: Добавить участников в чат
+      description: |
+        Добавляет одного или нескольких пользователей в групповой чат.
+        Доступно для owner и admin.
+        Для direct чатов всегда возвращает 403.
+        Если пользователь уже является участником — игнорируется (не ошибка).
+        Операция атомарна: либо все добавляются, либо никто.
+        После успешного добавления публикуется событие `chat.updated` в Kafka.
+      parameters:
+        - $ref: "#/components/parameters/ChatId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddMembersRequest"
+            example:
+              user_ids:
+                - "9d1e3f4a-5b6c-7d8e-9f0a-1b2c3d4e5f6a"
+                - "0e2f4a5b-6c7d-8e9f-0a1b-2c3d4e5f6a7b"
+      responses:
+        "200":
+          description: Обновлённый список участников (все, включая новых)
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemberList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /chats/{chat_id}/members/{user_id}:
+    get:
+      operationId: getMember
+      tags: [Members]
+      summary: Получить участника чата
+      description: |
+        Возвращает данные конкретного участника чата.
+        Доступно только участникам чата.
+      parameters:
+        - $ref: "#/components/parameters/ChatId"
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "200":
+          description: Данные участника
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatMember"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+    patch:
+      operationId: updateMemberRole
+      tags: [Members]
+      summary: Изменить роль участника
+      description: |
+        Изменяет роль участника в групповом чате.
+        Доступно только для owner.
+        Нельзя изменить роль самого owner.
+        Нельзя назначить роль owner через этот эндпоинт.
+        После успешного изменения публикуется событие `chat.updated` в Kafka.
+      parameters:
+        - $ref: "#/components/parameters/ChatId"
+        - $ref: "#/components/parameters/UserId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateMemberRoleRequest"
+            example:
+              role: "admin"
+      responses:
+        "200":
+          description: Обновлённые данные участника
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatMember"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+    delete:
+      operationId: removeMember
+      tags: [Members]
+      summary: Удалить участника из чата / покинуть чат
+      description: |
+        Удаляет участника из группового чата.
+
+        **Кто может удалять:**
+        - owner и admin могут удалять участников с ролью member
+        - admin не может удалить другого admin или owner
+        - owner может удалить кого угодно, кроме самого себя
+        - Любой участник может удалить самого себя (покинуть чат)
+
+        **Особый случай — owner покидает чат:**
+        Если owner хочет покинуть чат (`user_id == X-User-Id`), он должен сначала передать роль owner
+        другому участнику через `PATCH /chats/{chat_id}/members/{user_id}`. Иначе — 422.
+
+        Для direct чатов всегда возвращает 403.
+        После успешного удаления публикуется событие `chat.updated` в Kafka.
+        Повторный вызов вернёт 404 (участник уже удалён).
+      parameters:
+        - $ref: "#/components/parameters/ChatId"
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "204":
+          description: Участник удалён
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  # ══════════════════════════════════════════
+  # HEALTH
+  # ══════════════════════════════════════════
+
+  /health/live:
+    get:
+      operationId: healthLive
+      tags: [Chats]
+      summary: Liveness probe
+      description: Kubernetes liveness probe. Возвращает 200 если процесс жив.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+
+  /health/ready:
+    get:
+      operationId: healthReady
+      tags: [Chats]
+      summary: Readiness probe
+      description: |
+        Kubernetes readiness probe.
+        Возвращает 200 если сервис готов принимать трафик (БД доступна, миграции применены).
+        Возвращает 503 если сервис ещё не готов.
+      security: []
+      responses:
+        "200":
+          description: Сервис готов
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  checks:
+                    type: object
+                    properties:
+                      database:
+                        type: string
+                        example: "ok"
+        "503":
+          description: Сервис не готов
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "unavailable"
+                  checks:
+                    type: object
+                    properties:
+                      database:
+                        type: string
+                        example: "unreachable"
