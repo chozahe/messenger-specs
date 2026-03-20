@@ -1,0 +1,266 @@
+﻿Мессенджер — микросервисная архитектура (Chat / Message / Notification+Realtime)
+
+User Stories 
+Как пользователь — я хочу отправлять текстовые сообщения в личный диалог, чтобы собеседник получил их мгновенно.
+
+
+Как пользователь — я хочу видеть историю переписки с поиском по сообщениям.
+
+
+Как пользователь — я хочу получить индикатор «прочитано/доставлено» и статус online собеседника.
+
+
+Как пользователь — я хочу, чтобы изменения (редактирование/удаление) синхронизировались у всех участников.
+
+
+Как оператор — хочу наблюдаемость системы (метрики/трейсы/логи) и возможность ограничивать трафик (rate limiting).
+
+Use Cases
+Отправка сообщения (сингл API call → persist → publish event → realtime push).
+
+
+Получение истории (пагинация, фильтрация по дате/пользователю).
+
+
+Редактирование/удаление сообщения (версионирование/soft delete + событие в шину).
+
+
+Доставка и прочтение (квитирования доставки: delivered, read).
+
+
+Подключение websocket и управление presence (heartbeat, reconnect).
+
+
+Массовые уведомления (внешние интеграции/оповещения).
+
+NFR
+Доступность: сервисы должны быть устойчивы к отказу узла; Target SLA 99.95% (обсуждается).
+
+
+Производительность: p95 latency для доставки realtime < 200 ms (внутри кластера), p95 API response < 300 ms.
+
+
+Пропускная способность: стартовый таргет — 2000 сообщений/сек (масштабируемо до 100k+).
+
+
+Хранение: сообщения должны храниться ≥ 30 дней горячо + холодное хранение для архива (S3).
+
+
+Целостность: порядковость сообщений в чате — сохраняется per-chat (idempotency при повторной отправке).
+
+
+Безопасность: TLS everywhere, JWT/OAuth2, RBAC для сервисных API, шифрование at-rest для PII/attachments.
+
+
+Скалируемость: горизонтальная для всех сервисов; Kafka для разгрузки пиков.
+
+
+Observability: метрики (Prometheus), трейсы (OpenTelemetry), централизованные логи (EFK/LOKI), дашборды (Grafana), алерты (PagerDuty/opsgenie).
+
+
+Сохранность данных: резервное копирование БД + проверка восстановления.
+
+Микросервисы
+1) Chat Service (Go)
+
+
+Функции: создание/удаление чатов, управление участниками, список чатов пользователя, права доступа.
+
+
+API: REST/HTTP (gRPC опционально).
+
+
+БД: PostgreSQL (ACID, схемы: chats, chat_members, chat_metadata).
+
+
+Причина: хорош для транзакций (участники, права), schema-driven.
+
+
+2) Message Service (Python/Django)
+
+
+Функции: отправка сообщений, хранение истории, редактирование/удаление, поиск (базовый).
+
+
+API: REST + events publishing.
+
+
+БД: основная — PostgreSQL (messages, message_versions, indexes); опционально — NoSQL (MongoDB или Cassandra) для very-high-write / fast reads и sharding. Предпочтение: PostgreSQL + partitioning / timescaled / pgvector если нужен поиск/вектор.
+
+
+Eventing: публикует события в Kafka: message.created, message.updated, message.deleted, receipt.updated.
+
+
+3) Notification / Realtime Gateway (Gleam)
+
+
+Функции: читает события из Kafka, пушит websocket notifications, управляет websocket connections, online presence, delivery updates (push -> mobile/desktop).
+
+
+Состояние: ephemeral (connections), persistence of presence in Redis.
+
+
+БД: Redis (presence, session routing, ephemeral queues).
+
+
+Дополнительно: интеграция с FCM/APNs для push.
+
+
+
+
+
+
+Вспомогательные сервисы
+
+
+Auth Service (JWT/OAuth2) — внешняя/встроенная.
+
+
+Attachment Service / Object Storage — S3 compatible (attachments, media).
+
+
+Admin / Moderation Service — управление, модерация.
+
+
+Search Service (Elasticsearch) — полнотекстовый поиск по истории, если нужен.
+
+Связь между сервисами, Kafka / EDA
+chat.events (chat.created, chat.updated, chat.deleted)
+
+
+message.created (ключ: chat_id, partition by chat_id)
+
+
+message.updated
+
+
+message.deleted
+
+
+receipt.events (delivered/read)
+
+
+presence.events (online/offline/status)
+
+
+notification.requests (push to mobile)
+
+
+Конвенции:
+
+
+Partitioning by chat_id чтобы сохранить order per-chat.
+
+
+Использовать schema registry (Avro/Protobuf) для эволюции схем.
+
+
+Каждое событие включает event_id, occurred_at, source_service, payload_version.
+
+
+Идемпотентная обработка (consumer сохраняет offset + dedup по event_id).
+
+
+Данные — горячее и холодное хранение
+Горячее хранилище: PostgreSQL (partitioning по времени/чату) + Redis (кэш и presence). Хранение последних N сообщений в Redis для ultra-low-latency reads (LRU/pinned).
+Холодное хранилище / архив: Object storage (S3-compatible) — экспорт старых сообщений/attachments; метаданные в холодной таблице/NoSQL. Периодичность архивирования (например, старше 30 дней).
+
+Кэширование (Redis-like)
+Назначение: presence, active sessions, recent messages, rate-limiter counters, API tokens, routing table (connection -> node).
+Типы данных: Redis Hashes (user presence), Sorted Sets (recent activity), Streams (ephemeral message queues), TTL для ephemeral keys.
+Репликация/HA: Redis Cluster + sentinel/managed service.
+
+Маршрутизатор / Балансировщик / Rate Limiter
+Решение: API Gateway (Envoy/Traefik) + Load Balancer (k8s Ingress / LB).
+Rate Limiter: Token-Bucket в Redis (Lua scripts) на уровне Gateway + per-user/per-API keys; burst control + global quotas.
+Circuit Breaking: Envoy/Service Mesh (optional) или API Gateway.
+Authentication: Gateway проверяет JWT/OAuth, injects user-id into headers.
+
+Observability
+Metrics: Prometheus — экспортеры (service metrics, Kafka, Postgres).
+
+
+Tracing: OpenTelemetry (instrument services) → Jaeger/Tempo.
+
+
+Logging: structured JSON logs → ELK (Elasticsearch + Filebeat + Kibana) или Grafana Loki.
+
+
+Dashboards: Grafana — latency, errors, throughput, consumer lag (Kafka).
+
+
+Alerting: Prometheus Alertmanager → PagerDuty/Slack.
+
+
+SLO/SLA: определить SLOs (error budget, latency percentiles), оповещения по нарушению.
+
+C4 — Архитектурные представления
+готовится
+C4 — Container (список контейнеров и связи)
+
+
+Client (Web/Mobile) ↔ API Gateway (TLS)
+
+
+API Gateway ↔ Chat Service (Go, Postgres) (REST/gRPC)
+
+
+API Gateway ↔ Message Service (Python/Django, Postgres) (REST)
+
+
+Message Service → Kafka (publish events)
+
+
+Chat Service → Kafka (publish chat events)
+
+
+Notification/Realtime Gateway ← Kafka (consume events) → open websocket connections to clients; uses Redis for routing/presence.
+
+
+Message Service ↔ Search (indexing)
+
+
+Attachment Service ↔ Object Storage
+
+
+All services → Observability stack (OTel, Prometheus, ELK)
+
+
+(можно представить в простом ASCII-блоке если нужно — могу добавить)
+
+
+C4 — Component (Message Service example)
+
+
+Компоненты Message Service:
+
+
+API Controller (REST endpoints)
+
+
+Message Processor (validates, stores in Postgres, versioning)
+
+
+Event Publisher (Kafka producer + schema registry)
+
+
+Storage Layer (DAO, partitioned tables)
+
+
+Indexer (pushes to Search)
+
+
+Background Jobs (archival to S3, retention)
+
+
+Общее техническое задание
+Разрабатывается распределённая система мессенджера, состоящая из трёх основных микросервисов: Chat Service (Go), Message Service (Python/Django) и Notification / Realtime Gateway (Gleam). Система должна обеспечивать создание чатов, обмен сообщениями, хранение истории, а также доставку сообщений в реальном времени с поддержкой статусов доставки и присутствия пользователей (online/offline). Все сервисы должны быть связаны через событийную архитектуру (Event-Driven Architecture) с использованием Kafka.
+Chat Service реализуется на языке Go и отвечает за управление чатами и участниками. В рамках данного сервиса необходимо реализовать создание личных диалогов и групповых чатов, добавление и удаление участников, а также получение списка чатов пользователя. Все данные должны храниться в PostgreSQL, с нормализованной схемой, включающей таблицы чатов, участников и метаданных. Сервис должен предоставлять REST API (или gRPC при необходимости) для взаимодействия через API Gateway. При создании или изменении чата сервис должен публиковать события в Kafka (например, chat.created, chat.updated), чтобы остальные сервисы могли реагировать на изменения. Особое внимание необходимо уделить транзакционности операций (например, при добавлении участников) и обеспечению консистентности данных.
+Message Service реализуется на Python с использованием Django и отвечает за основную бизнес-логику обмена сообщениями. Сервис должен обеспечивать отправку сообщений, хранение истории, редактирование и удаление сообщений, а также выдачу истории переписки с пагинацией. Основной базой данных является PostgreSQL, с возможным использованием партиционирования таблиц по времени или chat_id для повышения производительности. При отправке сообщения сервис обязан сначала сохранить его в базе данных, а затем опубликовать событие в Kafka (message.created). Для гарантии доставки событий необходимо использовать паттерн outbox или транзакционную запись. Также должны публиковаться события при редактировании и удалении сообщений. Сервис должен поддерживать идемпотентность операций (например, при повторной отправке сообщения) и обеспечивать порядок сообщений внутри одного чата. Дополнительно допускается использование NoSQL (например, MongoDB) в будущем для масштабирования, но в рамках MVP предпочтение отдаётся PostgreSQL. API сервиса должен быть реализован через REST, с поддержкой аутентификации (JWT).
+Notification / Realtime Gateway реализуется на Gleam и отвечает за доставку событий пользователям в реальном времени. Сервис должен подписываться на события из Kafka (message.created, message.updated, receipt.updated и др.), обрабатывать их и отправлять клиентам через WebSocket-соединения. Также сервис должен управлять подключениями пользователей, отслеживать их online/offline статус и хранить состояние присутствия в Redis. Redis используется как быстрое in-memory хранилище для хранения сессий, маршрутизации соединений и временных данных. При получении события о новом сообщении сервис должен определить, какие пользователи подключены, и отправить им обновление. В случае отсутствия подключения возможна интеграция с push-уведомлениями (опционально). Также сервис должен обрабатывать подтверждения доставки (delivered/read) и публиковать соответствующие события обратно в Kafka.
+Связь между микросервисами должна быть реализована через Kafka с использованием подхода Event-Driven Architecture. Каждый сервис публикует события и подписывается на необходимые ему топики. Для обеспечения порядка сообщений необходимо использовать партиционирование Kafka по chat_id. Все события должны иметь единый формат с метаданными (event_id, timestamp, версия схемы). Рекомендуется использовать schema registry (Avro или Protobuf) для управления версиями событий. Все consumer’ы должны быть идемпотентными и корректно обрабатывать повторные события.
+Для хранения данных используется комбинация RDBMS и in-memory хранилища. PostgreSQL используется как основное хранилище для чатов и сообщений. Redis используется для кэширования, хранения online presence и временных данных. Дополнительно необходимо предусмотреть холодное хранилище (например, S3-совместимое), куда могут архивироваться старые сообщения и вложения. Данные должны иметь жизненный цикл: горячие (активные), тёплые и холодные.
+Система должна использовать API Gateway или балансировщик (например, Nginx, Envoy или Traefik) для маршрутизации запросов к сервисам. Также на уровне gateway должен быть реализован rate limiting (например, через Redis) для защиты от перегрузки. Все сервисы должны быть защищены с использованием TLS и JWT-аутентификации.
+Для повышения производительности необходимо использовать кэширование через Redis. В кэше могут храниться последние сообщения чатов, информация о пользователях и активные сессии. Кэш должен иметь TTL и стратегию инвалидации при изменении данных.
+Система должна быть наблюдаемой (observability). Каждый сервис обязан предоставлять метрики (Prometheus), логи (в структурированном формате) и трейсы (OpenTelemetry). Необходимо настроить централизованный сбор логов (например, ELK или Loki), а также дашборды и алерты (Grafana + Alertmanager). Особое внимание должно уделяться мониторингу Kafka (consumer lag), latency API и ошибкам.
+Развёртывание системы предполагается в контейнерной среде (Docker + Kubernetes). Каждый сервис должен быть независимо масштабируемым. Необходимо настроить CI/CD pipeline для автоматической сборки, тестирования и деплоя. Также должны быть реализованы health checks (liveness/readiness) и механизмы отказоустойчивости (retry, circuit breaker).
