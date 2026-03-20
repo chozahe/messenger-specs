@@ -67,7 +67,8 @@
 | `cannot_modify_direct_chat` | 403 | Нельзя изменить direct чат (добавить участника, переименовать) |
 | `cannot_remove_owner` | 422 | Нельзя удалить owner из чата напрямую |
 | `owner_must_transfer_before_leave` | 422 | Owner должен передать роль перед выходом из чата |
-| `cannot_set_owner_role` | 422 | Нельзя назначить роль owner через API |
+| `cannot_transfer_owner_to_self` | 422 | Нельзя передать роль owner самому себе |
+| `owner_transfer_target_invalid` | 422 | Роль owner можно передать только активному участнику group-чата |
 | `members_limit_exceeded` | 422 | Превышен лимит участников (1000 для group) |
 
 ### Message Service

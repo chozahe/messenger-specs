@@ -32,12 +32,13 @@ CREATE TABLE chats (
     title           TEXT,                          -- только для group, NULL для direct
     avatar_url      TEXT,                          -- только для group
     created_by      UUID            NOT NULL,      -- user_id создателя
+    last_message_at TIMESTAMPTZ,                   -- денормализованная активность чата, обновляется по message.created
     deleted_at      TIMESTAMPTZ,                   -- soft delete
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
 
     -- для direct чата: пара участников уникальна
-    -- реализуется через partial unique index ниже
+    -- реализуется через direct_chat_index ниже
     CONSTRAINT chats_title_required_for_group
         CHECK (type = 'direct' OR title IS NOT NULL),
     CONSTRAINT chats_title_null_for_direct
@@ -193,7 +194,7 @@ CREATE VIEW active_chat_members AS
 --    WHERE cm.user_id = $1
 --      AND cm.left_at IS NULL
 --      AND c.deleted_at IS NULL
---    ORDER BY c.updated_at DESC
+--    ORDER BY COALESCE(c.last_message_at, c.created_at) DESC
 --    LIMIT 20;
 
 -- 2. Проверка членства пользователя в чате

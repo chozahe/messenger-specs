@@ -10,6 +10,9 @@ info:
     `Authorization: Bearer <token>`. Валидация токена происходит на уровне API Gateway —
     сервис получает уже проверенный `X-User-Id` в заголовке запроса.
 
+    **Межсервисные вызовы:** для point lookup / authorization checks допускается service-to-service
+    вызов с `Authorization: Bearer <service_token>` и `X-Service-Name` по контракту `contracts/auth.md`.
+
     **Версионирование:** текущая версия API — `v1`. Префикс `/api/v1` обязателен.
 
     **Идемпотентность:** отправка сообщения поддерживает заголовок `Idempotency-Key`.
@@ -52,6 +55,7 @@ components:
       description: |
         JWT выдаётся Auth Service. Валидируется на API Gateway.
         Сервис получает `X-User-Id` и `X-User-Roles` в заголовках — не валидирует токен самостоятельно.
+        Для межсервисных вызовов допускается service token по контракту `contracts/auth.md`.
 
   # ─────────────────────────────────────────────
   # HEADERS
@@ -117,6 +121,25 @@ components:
       description: Курсор пагинации (opaque string из предыдущего ответа)
       schema:
         type: string
+
+    HistoryCursor:
+      name: cursor
+      in: query
+      required: false
+      description: |
+        Opaque cursor, сгенерированный Message Service.
+        Клиент не должен формировать или изменять его вручную.
+
+        Логическая структура cursor после декодирования base64url:
+        `{"v":1,"mode":"before"|"after","seq":<int64>}`
+
+        - `mode = "before"` — вернуть сообщения с `sequence_number < seq`
+        - `mode = "after"` — вернуть сообщения с `sequence_number > seq`
+
+        `cursor` нельзя комбинировать с `before`, `after` или `around`.
+      schema:
+        type: string
+      example: "eyJ2IjoxLCJtb2RlIjoiYmVmb3JlIiwic2VxIjo0Mn0"
 
     IdempotencyKey:
       name: Idempotency-Key
@@ -366,11 +389,17 @@ components:
         next_cursor:
           type: string
           nullable: true
-          description: Курсор для следующей страницы (более новые сообщения). Null если страниц больше нет.
+          description: |
+            Курсор для получения более новых сообщений.
+            Эквивалентен anchor `after = max(sequence_number)` текущей страницы.
+            Null если более новых сообщений нет.
         prev_cursor:
           type: string
           nullable: true
-          description: Курсор для предыдущей страницы (более старые сообщения). Null если это самое начало.
+          description: |
+            Курсор для получения более старых сообщений.
+            Эквивалентен anchor `before = min(sequence_number)` текущей страницы.
+            Null если более старых сообщений нет.
         has_next:
           type: boolean
         has_prev:
@@ -833,42 +862,69 @@ paths:
         **Пагинация:**
         - Для загрузки свежих сообщений (вниз) — используй `next_cursor`.
         - Для подгрузки старой истории (вверх) — используй `prev_cursor`.
-        - Для первоначальной загрузки (самые свежие) — передай `direction=before` без курсора.
+        - Для первоначальной загрузки без курсора и без фильтров сервис возвращает последние `limit`
+          сообщений чата, но в ответе они всё равно отсортированы по `sequence_number` asc.
+        - `next_cursor` всегда указывает на более новые сообщения относительно текущей страницы.
+        - `prev_cursor` всегда указывает на более старые сообщения относительно текущей страницы.
 
         **Фильтрация:**
         - `before` — сообщения до указанного `sequence_number` (не включительно).
         - `after` — сообщения после указанного `sequence_number` (не включительно).
         - `around` — сообщения вокруг указанного `sequence_number` (для перехода к конкретному сообщению).
 
+        **Правила валидации параметров:**
+        - Можно передать не более одного из: `cursor`, `before`, `after`, `around`.
+        - Если передан `cursor`, параметры `before`, `after`, `around` запрещены.
+        - Если не передан ни один anchor-параметр, используется режим initial load.
+        - В режиме `around` сервис старается вернуть центрированное окно:
+          примерно `floor(limit/2)` сообщений до anchor и оставшиеся после него.
+        - Anchor `around` не обязан точно совпадать с существующим сообщением:
+          сервис возвращает ближайшее окно по `sequence_number`.
+
+        **Семантика режимов:**
+        - initial load: последние `limit` сообщений чата
+        - `before = N`: ближайшие `limit` сообщений с `sequence_number < N`
+        - `after = N`: ближайшие `limit` сообщений с `sequence_number > N`
+        - `around = N`: окно вокруг `N`
+        - `cursor`: продолжение одной из предыдущих страниц в направлении, закодированном сервисом
+
         **Удалённые сообщения:** включаются в историю с `status = deleted`, но без контента.
         Это необходимо для корректного отображения "Сообщение удалено" в клиенте.
       parameters:
         - $ref: "#/components/parameters/ChatId"
         - $ref: "#/components/parameters/PageLimit"
-        - $ref: "#/components/parameters/PageCursor"
+        - $ref: "#/components/parameters/HistoryCursor"
         - name: before
           in: query
           required: false
-          description: Вернуть сообщения с sequence_number < этого значения
+          description: |
+            Вернуть сообщения с `sequence_number < before`.
+            Используется только как initial anchor и не комбинируется с `cursor`, `after`, `around`.
           schema:
             type: integer
             format: int64
+          example: 120
         - name: after
           in: query
           required: false
-          description: Вернуть сообщения с sequence_number > этого значения
+          description: |
+            Вернуть сообщения с `sequence_number > after`.
+            Используется только как initial anchor и не комбинируется с `cursor`, `before`, `around`.
           schema:
             type: integer
             format: int64
+          example: 42
         - name: around
           in: query
           required: false
           description: |
             Вернуть сообщения вокруг этого sequence_number.
             Вернёт примерно limit/2 сообщений до и limit/2 после.
+            Не комбинируется с `cursor`, `before`, `after`.
           schema:
             type: integer
             format: int64
+          example: 100
       responses:
         "200":
           description: История сообщений
@@ -894,10 +950,10 @@ paths:
                     created_at: "2024-06-01T10:00:00Z"
                     updated_at: "2024-06-01T10:00:00Z"
                 pagination:
-                  next_cursor: "eyJzZXEiOjF9"
-                  prev_cursor: null
+                  next_cursor: "eyJ2IjoxLCJtb2RlIjoiYWZ0ZXIiLCJzZXEiOjQyfQ"
+                  prev_cursor: "eyJ2IjoxLCJtb2RlIjoiYmVmb3JlIiwic2VxIjoxfQ"
                   has_next: true
-                  has_prev: false
+                  has_prev: true
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -908,6 +964,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
@@ -1057,8 +1115,9 @@ paths:
         **Процесс:**
         1. Обновляет статус receipt для всех сообщений с `sequence_number <= last_read_sequence_number`
            где `user_id = X-User-Id`.
-        2. Публикует событие `receipt.updated` (read) в Kafka.
-        3. Realtime Gateway потребляет событие и уведомляет отправителей сообщений.
+        2. Публикует событие `receipt.read` в топик `receipt.events`.
+        3. Realtime Gateway потребляет событие и отправляет в WebSocket агрегированное
+           `receipt.updated` с `status = read` и `last_read_sequence_number`.
 
         Вызов идемпотентен: повторная отметка уже прочитанных сообщений не является ошибкой.
         Нельзя отметить как прочитанные свои собственные сообщения (игнорируется).

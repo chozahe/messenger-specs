@@ -10,6 +10,9 @@ info:
     `Authorization: Bearer <token>`. Валидация токена происходит на уровне API Gateway —
     сервис получает уже проверенный `X-User-Id` в заголовке запроса.
 
+    **Межсервисные вызовы:** для point lookup / authorization checks допускается service-to-service
+    вызов с `Authorization: Bearer <service_token>` и `X-Service-Name` по контракту `contracts/auth.md`.
+
     **Версионирование:** текущая версия API — `v1`. Префикс `/api/v1` обязателен.
 
     **Идемпотентность:** операции создания поддерживают заголовок `Idempotency-Key`.
@@ -26,6 +29,8 @@ tags:
     description: Создание, получение и удаление чатов
   - name: Members
     description: Управление участниками чата
+  - name: Internal
+    description: Внутренние service-to-service point lookup endpoints
 
 # ─────────────────────────────────────────────
 # SECURITY
@@ -42,6 +47,14 @@ components:
       description: |
         JWT выдаётся Auth Service. Валидируется на API Gateway.
         Сервис получает `X-User-Id` и `X-User-Roles` в заголовках — не валидирует токен самостоятельно.
+        Для межсервисных вызовов допускается service token по контракту `contracts/auth.md`.
+    ServiceBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Service-to-service JWT с `type = service`, `roles = ["service"]`
+        и обязательным заголовком `X-Service-Name`.
 
   # ─────────────────────────────────────────────
   # HEADERS
@@ -119,6 +132,19 @@ components:
       schema:
         type: string
         maxLength: 64
+
+    XServiceName:
+      name: X-Service-Name
+      in: header
+      required: true
+      description: |
+        Имя вызывающего сервиса. Должно совпадать с `service_name` claim service token.
+        Разрешённые значения зависят от конкретного internal endpoint.
+      schema:
+        type: string
+        enum:
+          - message-service
+          - realtime-gateway
 
   # ─────────────────────────────────────────────
   # SCHEMAS
@@ -215,7 +241,7 @@ components:
           type: string
           format: date-time
           nullable: true
-          description: Время последнего сообщения в чате. Обновляется асинхронно через событие.
+          description: Денормализованное время последнего сообщения в чате. Обновляется асинхронно по событию `message.created`.
 
     ChatList:
       type: object
@@ -255,6 +281,103 @@ components:
         has_next:
           type: boolean
           description: Есть ли следующая страница
+
+    InternalChatMembership:
+      type: object
+      required:
+        - chat_id
+        - user_id
+        - is_member
+        - chat_type
+        - checked_at
+      properties:
+        chat_id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        is_member:
+          type: boolean
+          description: Состоит ли пользователь в активных участниках чата на момент проверки
+        role:
+          allOf:
+            - $ref: "#/components/schemas/MemberRole"
+          nullable: true
+          description: Роль пользователя в чате. Null если пользователь не состоит в чате.
+        joined_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Время вступления. Null если пользователь не состоит в чате.
+        chat_type:
+          $ref: "#/components/schemas/ChatType"
+        checked_at:
+          type: string
+          format: date-time
+          description: Когда была выполнена проверка
+
+    InternalChatSnapshot:
+      type: object
+      required:
+        - chat
+        - members
+        - snapshot_at
+      properties:
+        chat:
+          $ref: "#/components/schemas/Chat"
+        members:
+          type: array
+          description: Все активные участники чата на момент снимка
+          items:
+            $ref: "#/components/schemas/ChatMember"
+        snapshot_at:
+          type: string
+          format: date-time
+          description: Когда был сформирован snapshot
+
+    InternalUserChatRef:
+      type: object
+      required:
+        - chat_id
+        - type
+        - role
+        - joined_at
+        - updated_at
+      properties:
+        chat_id:
+          type: string
+          format: uuid
+        type:
+          $ref: "#/components/schemas/ChatType"
+        role:
+          $ref: "#/components/schemas/MemberRole"
+        joined_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_message_at:
+          type: string
+          format: date-time
+          nullable: true
+        members_count:
+          type: integer
+          minimum: 2
+
+    InternalUserChatRefList:
+      type: object
+      required:
+        - items
+        - pagination
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/InternalUserChatRef"
+        pagination:
+          $ref: "#/components/schemas/CursorPagination"
 
     # ── Requests ──────────────────────────────
 
@@ -336,9 +459,13 @@ components:
         role:
           type: string
           enum:
+            - owner
             - admin
             - member
-          description: Новая роль участника. Нельзя назначить owner через этот эндпоинт.
+          description: |
+            Новая роль участника.
+            `owner` допустим только для передачи владения чатом от текущего owner другому активному участнику.
+            При такой операции предыдущий owner автоматически понижается до `admin`.
 
     # ── Errors ────────────────────────────────
 
@@ -477,7 +604,7 @@ paths:
       summary: Список чатов текущего пользователя
       description: |
         Возвращает все чаты, в которых состоит аутентифицированный пользователь (из `X-User-Id`).
-        Результат отсортирован по `last_message_at` desc (сначала активные чаты).
+        Результат отсортирован по `COALESCE(last_message_at, created_at)` desc (сначала активные чаты).
         Поддерживает курсорную пагинацию.
       parameters:
         - $ref: "#/components/parameters/PageLimit"
@@ -565,6 +692,15 @@ paths:
       responses:
         "201":
           description: Чат успешно создан
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Chat"
+        "200":
+          description: Чат уже создан ранее (idempotent повтор)
           headers:
             X-Request-Id:
               $ref: "#/components/headers/X-Request-Id"
@@ -811,8 +947,8 @@ paths:
       description: |
         Изменяет роль участника в групповом чате.
         Доступно только для owner.
-        Нельзя изменить роль самого owner.
-        Нельзя назначить роль owner через этот эндпоинт.
+        Нельзя изменить роль самого owner через этот эндпоинт на `admin` или `member`.
+        Передача роли `owner` другому участнику разрешена и атомарно понижает текущего owner до `admin`.
         После успешного изменения публикуется событие `chat.updated` в Kafka.
       parameters:
         - $ref: "#/components/parameters/ChatId"
@@ -883,6 +1019,144 @@ paths:
           $ref: "#/components/responses/NotFound"
         "422":
           $ref: "#/components/responses/UnprocessableEntity"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  # ══════════════════════════════════════════
+  # INTERNAL
+  # ══════════════════════════════════════════
+
+  /internal/chats/{chat_id}/members/{user_id}:
+    get:
+      operationId: getChatMembershipInternal
+      tags: [Internal]
+      summary: Проверить членство пользователя в чате
+      description: |
+        Internal endpoint для service-to-service authorization checks.
+
+        **Кто вызывает:**
+        - `message-service` — перед отправкой/чтением/редактированием сообщений
+        - `realtime-gateway` — при cold start или cache miss
+
+        **Семантика ответа:**
+        - `404` — чат не существует или soft-deleted
+        - `200` + `is_member = true` — пользователь является активным участником
+        - `200` + `is_member = false` — чат существует, но пользователь не состоит в нём
+      security:
+        - ServiceBearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XServiceName"
+        - $ref: "#/components/parameters/ChatId"
+        - $ref: "#/components/parameters/UserId"
+      responses:
+        "200":
+          description: Результат проверки членства
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalChatMembership"
+              examples:
+                member:
+                  summary: Пользователь состоит в чате
+                  value:
+                    chat_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+                    user_id: "7b9c1d2e-3f4a-5b6c-7d8e-9f0a1b2c3d4e"
+                    is_member: true
+                    role: "member"
+                    joined_at: "2024-01-15T10:05:00Z"
+                    chat_type: "group"
+                    checked_at: "2024-06-01T10:00:00Z"
+                not_member:
+                  summary: Пользователь не состоит в чате
+                  value:
+                    chat_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+                    user_id: "11111111-2222-3333-4444-555555555555"
+                    is_member: false
+                    role: null
+                    joined_at: null
+                    chat_type: "group"
+                    checked_at: "2024-06-01T10:00:00Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /internal/chats/{chat_id}/snapshot:
+    get:
+      operationId: getChatSnapshotInternal
+      tags: [Internal]
+      summary: Получить snapshot чата с активными участниками
+      description: |
+        Internal endpoint для заполнения или восстановления локального кэша Realtime Gateway.
+
+        Возвращает:
+        - метаданные чата
+        - список всех активных участников без пагинации
+
+        Endpoint рассчитан на point lookup одного чата. Для массовой синхронизации используется
+        `/internal/users/{user_id}/chats`.
+      security:
+        - ServiceBearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XServiceName"
+        - $ref: "#/components/parameters/ChatId"
+      responses:
+        "200":
+          description: Snapshot чата
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalChatSnapshot"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /internal/users/{user_id}/chats:
+    get:
+      operationId: listUserChatsInternal
+      tags: [Internal]
+      summary: Получить paginated список активных чатов пользователя
+      description: |
+        Internal endpoint для cold start Realtime Gateway и других service-to-service lookup-сценариев.
+
+        Возвращает только активные чаты (`deleted_at IS NULL`) и только активное членство (`left_at IS NULL`).
+        Пагинация курсорная, сортировка по `COALESCE(last_message_at, created_at)` desc.
+      security:
+        - ServiceBearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XServiceName"
+        - $ref: "#/components/parameters/UserId"
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageCursor"
+      responses:
+        "200":
+          description: Список чатов пользователя для internal use
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalUserChatRefList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "500":
           $ref: "#/components/responses/InternalServerError"
 

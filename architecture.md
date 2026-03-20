@@ -2,7 +2,7 @@
 
 ## Общий подход
 
-Система построена по принципу микросервисной архитектуры с событийным взаимодействием (Event-Driven Architecture). Сервисы не вызывают друг друга напрямую — они общаются через Kafka. Синхронное взаимодействие (REST/gRPC) используется только между клиентом и сервисами через API Gateway.
+Система построена по принципу микросервисной архитектуры с событийным взаимодействием (Event-Driven Architecture). Доменные изменения и уведомления передаются через Kafka. Синхронные REST/gRPC вызовы между сервисами допустимы только для point lookup и authorization checks по service-to-service контракту.
 
 Каждый сервис:
 - независимо деплоится и масштабируется
@@ -24,10 +24,15 @@
 
 Операции с участниками выполняются транзакционно — это одна из причин выбора Go и PostgreSQL: хорошая поддержка ACID и низкий оверхед на конкурентность.
 
-При любом изменении чата сервис публикует событие в Kafka. Сам не подписывается ни на что — является source of truth для чатов.
+При любом изменении чата сервис публикует событие в Kafka. Для поддержки денормализованного поля `last_message_at` сервис также потребляет `message.created` и обновляет активность чата без изменения source of truth для сообщений.
+
+Internal point lookup endpoints Chat Service:
+- `GET /api/v1/internal/chats/{chat_id}/members/{user_id}` — проверка членства/роли
+- `GET /api/v1/internal/chats/{chat_id}/snapshot` — snapshot чата с активными участниками
+- `GET /api/v1/internal/users/{user_id}/chats` — paginated список активных чатов пользователя
 
 **Таблицы:**
-- `chats` — метаданные чата (id, type, created_at, ...)
+- `chats` — метаданные чата (id, type, last_message_at, created_at, ...)
 - `chat_members` — участники (chat_id, user_id, role, joined_at, ...)
 - `chat_metadata` — дополнительные атрибуты чата
 
@@ -45,7 +50,7 @@
 
 Поддерживает идемпотентность: повторная отправка одного сообщения (по `idempotency_key`) не создаёт дубликат. Порядок сообщений гарантируется внутри чата через партиционирование Kafka по `chat_id`.
 
-Таблицы партиционированы по времени или `chat_id` для производительности при больших объёмах.
+Таблица `messages` партиционирована по времени (monthly) для производительности при больших объёмах.
 
 **Таблицы:**
 - `messages` — основная таблица сообщений
@@ -66,12 +71,16 @@ BEAM/OTP выбран намеренно: модель акторов хорош
 
 При получении события о новом сообщении сервис определяет, какие пользователи подключены прямо сейчас, и отправляет им обновление через соответствующее WebSocket-соединение. Если пользователь не подключён — опционально триггерится push-уведомление (FCM/APNs).
 
-Также принимает от клиентов подтверждения доставки и прочтения, и публикует их обратно в Kafka как `receipt.events`.
+Принимает от клиентов WebSocket-ack подтверждения доставки и публикует их в Kafka как `receipt.delivered` в топик `receipt.events`. Статусы прочтения формируются Message Service после REST-вызова `POST /api/v1/chats/{chat_id}/receipts/read`.
+
+Realtime Gateway преобразует Kafka-события receipts в единый клиентский WS-тип `receipt.updated`:
+- `receipt.delivered` → per-message payload с `message_id`
+- `receipt.read` → aggregate payload с `last_read_sequence_number`
 
 **Redis:**
-- `presence:{user_id}` — online статус, TTL
-- `session:{user_id}` — к какому узлу подключён пользователь
-- `conn:{connection_id}` — метаданные соединения
+- `gw:presence:{user_id}` — online статус, TTL
+- `gw:session:{user_id}` — к какому узлу подключён пользователь
+- `gw:conn:{connection_id}` — метаданные соединения
 
 ---
 
@@ -106,13 +115,13 @@ BEAM/OTP выбран намеренно: модель акторов хорош
 
 ## Поток данных — отправка сообщения
 
-1. Клиент отправляет `POST /messages` в Message Service через API Gateway.
+1. Клиент отправляет `POST /api/v1/chats/{chat_id}/messages` в Message Service через API Gateway.
 2. API Gateway валидирует JWT, инжектит `user_id`.
 3. Message Service сохраняет сообщение в PostgreSQL + пишет запись в `outbox_events` — в одной транзакции.
 4. Outbox worker вычитывает запись и публикует `message.created` в Kafka (топик партиционирован по `chat_id`).
 5. Realtime Gateway потребляет `message.created`, находит активные WebSocket-соединения участников чата, пушит им событие.
 6. Клиент-получатель получает сообщение через WebSocket, отправляет подтверждение доставки.
-7. Realtime Gateway публикует `receipt.events` (delivered) в Kafka.
+7. Realtime Gateway публикует `receipt.delivered` в топик `receipt.events`.
 8. Message Service потребляет `receipt.events`, обновляет статус доставки в БД.
 
 ---
@@ -120,7 +129,7 @@ BEAM/OTP выбран намеренно: модель акторов хорош
 ## Поток данных — подключение клиента
 
 1. Клиент устанавливает WebSocket-соединение к Realtime Gateway, передаёт JWT.
-2. Gateway валидирует токен, регистрирует соединение в Redis (`session:{user_id}`, `conn:{connection_id}`).
+2. Gateway валидирует токен, регистрирует соединение в Redis (`gw:session:{user_id}`, `gw:conn:{connection_id}`).
 3. Gateway публикует `presence.events` (online) в Kafka.
 4. При разрыве соединения или истечении heartbeat — удаляет запись из Redis, публикует presence offline.
 
@@ -130,12 +139,12 @@ BEAM/OTP выбран намеренно: модель акторов хорош
 
 ### Горячее хранилище
 
-- **PostgreSQL** — чаты, сообщения, участники. Основное хранилище. Партиционирование таблицы `messages` по времени или `chat_id`.
+- **PostgreSQL** — чаты, сообщения, участники. Основное хранилище. Партиционирование таблицы `messages` по времени (monthly).
 - **Redis** — presence, сессии, маршрутизация соединений, кэш последних сообщений чата (LRU), rate-limit counters.
 
 ### Холодное хранилище
 
-Сообщения и вложения старше 30 дней архивируются в S3-compatible object storage. Метаданные архивных сообщений остаются в PostgreSQL с флагом `archived = true`. При запросе архивной истории Message Service проксирует запрос в холодное хранилище.
+Сообщения и вложения старше 30 дней архивируются в S3-compatible object storage. Сведения об архивированных партициях фиксируются в таблице `archived_partitions`. При запросе архивной истории Message Service проксирует запрос в холодное хранилище.
 
 ---
 

@@ -130,4 +130,20 @@ X-Service-Name: message-service
 Service token — отдельный JWT с `type: service`, выдаётся Auth Service для каждого сервиса.
 Роль в таком токене: `service`.
 
-Сервис-получатель проверяет наличие `X-Service-Name` и роль `service` в токене.
+Рекомендуемый payload service token:
+
+```json
+{
+  "sub": "message-service",
+  "iat": 1717200000,
+  "exp": 1717203600,
+  "roles": ["service"],
+  "type": "service",
+  "service_name": "message-service"
+}
+```
+
+Сервис-получатель проверяет:
+- наличие `X-Service-Name`
+- роль `service` в токене
+- совпадение `X-Service-Name` и `service_name` claim, если claim присутствует

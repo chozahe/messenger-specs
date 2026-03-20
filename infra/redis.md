@@ -103,8 +103,8 @@ SET gw:presence:{user_id} "online" EX 65
 
 ### `gw:dedup:{event_id}`
 
-**Тип:** String  
-**TTL:** 24 часа  
+**Тип:** String
+**TTL:** 24 часа
 **Назначение:** дедупликация событий из Kafka (идемпотентность consumer'а)
 
 ```
@@ -166,8 +166,8 @@ EXPIRE msg:ratelimit:{user_id} 60   # только если ключ новый
 
 ### `msg:dedup:{idempotency_key}`
 
-**Тип:** String  
-**TTL:** 24 часа  
+**Тип:** String
+**TTL:** 24 часа
 **Назначение:** дедупликация отправки сообщений по `Idempotency-Key`
 
 ```
@@ -179,6 +179,21 @@ SET msg:dedup:{idempotency_key} {message_id} EX 86400 NX
 ---
 
 ## Chat Service
+
+### `chat:dedup:{idempotency_key}`
+
+**Тип:** String
+**TTL:** 24 часа
+**Назначение:** дедупликация create/add-member операций по `Idempotency-Key`
+
+```
+SET chat:dedup:{idempotency_key} <result_ref> EX 86400 NX
+```
+
+`result_ref` — идентификатор результата операции (`chat_id` или иной opaque reference,
+по которому сервис может вернуть исходный ответ без повторного выполнения).
+
+---
 
 ### `chat:member_check:{chat_id}:{user_id}`
 
@@ -230,6 +245,7 @@ return current
 | `msg:cache:chat_messages:{chat_id}` | List | 10 мин | Message Service | Кэш последних сообщений |
 | `msg:ratelimit:{user_id}` | String | 60 сек | Message Service | Rate limit отправки |
 | `msg:dedup:{idempotency_key}` | String | 24 ч | Message Service | Дедупликация сообщений |
+| `chat:dedup:{idempotency_key}` | String | 24 ч | Chat Service | Дедупликация create/add-member операций |
 | `chat:member_check:{chat_id}:{user_id}` | String | 5 мин | Chat Service | Кэш членства |
 | `gw:ratelimit:{user_id}:{endpoint}` | String | 60 сек | API Gateway | Глобальный rate limit |
 
